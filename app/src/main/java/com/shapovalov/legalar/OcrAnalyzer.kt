@@ -1,19 +1,30 @@
 package com.shapovalov.legalar
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.RectF
 import android.os.SystemClock
+import android.util.Log
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.Text
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.googlecode.tesseract.android.ResultIterator
+import com.googlecode.tesseract.android.TessBaseAPI
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
 
 data class TextBlockBox(
     val text: String,
@@ -66,7 +77,7 @@ data class ScanResult(
     }
 }
 
-private const val DEFAULT_MIN_INTERVAL_MILLIS = 500L
+private const val DEFAULT_MIN_INTERVAL_MILLIS = 700L
 
 private const val REGEX_FLAGS = "(?iu)"
 
@@ -82,19 +93,35 @@ private const val ARTICLE_GROUP =
 private const val MARKER_GROUP = "(?:ст\\s*\\.\\s*|стать[иеяю]\\s*|ст\\s+)"
 
 class OcrAnalyzer(
+    private val context: Context,
     private val repository: LegalRepository,
     private val scope: CoroutineScope,
     private val onScanResult: (ScanResult) -> Unit,
     private val minIntervalMillis: Long = DEFAULT_MIN_INTERVAL_MILLIS
 ) : ImageAnalysis.Analyzer {
 
-    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-
     private val busy = AtomicBoolean(false)
 
     private val lastStartMillis = AtomicLong(0L)
 
     private val cache = ConcurrentHashMap<String, LegalReference>()
+
+    private val engineLock = ReentrantLock()
+
+    @Volatile
+    private var tessBaseApi: TessBaseAPI? = null
+
+    @Volatile
+    private var initFailed = false
+
+    private var initAttempts = 0
+
+    @Volatile
+    private var released = false
+
+    private val preprocessPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        colorFilter = buildColorFilter()
+    }
 
     private val notFound = LegalReference(
         id = NOT_FOUND_ID,
@@ -111,13 +138,8 @@ class OcrAnalyzer(
 
     @ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
-            imageProxy.close()
-            return
-        }
         val now = SystemClock.elapsedRealtime()
-        if (busy.get() || now - lastStartMillis.get() < minIntervalMillis) {
+        if (released || initFailed || busy.get() || now - lastStartMillis.get() < minIntervalMillis) {
             imageProxy.close()
             return
         }
@@ -128,77 +150,166 @@ class OcrAnalyzer(
         lastStartMillis.set(now)
 
         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-        val sourceWidth: Int
-        val sourceHeight: Int
-        if (rotationDegrees == QUARTER_TURN || rotationDegrees == THREE_QUARTER_TURN) {
-            sourceWidth = imageProxy.height
-            sourceHeight = imageProxy.width
-        } else {
-            sourceWidth = imageProxy.width
-            sourceHeight = imageProxy.height
+        val captured = try {
+            imageProxy.toBitmap()
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Frame conversion failed", error)
+            null
+        } finally {
+            imageProxy.close()
+        }
+        if (captured == null) {
+            busy.set(false)
+            return
         }
 
-        val inputImage = InputImage.fromMediaImage(mediaImage, rotationDegrees)
-        recognizer.process(inputImage)
-            .addOnSuccessListener { visionText ->
-                scope.launch {
-                    handleText(visionText, sourceWidth, sourceHeight)
-                }
-            }
-            .addOnCompleteListener {
-                busy.set(false)
-                imageProxy.close()
-            }
+        val prepared = prepare(captured, rotationDegrees)
+        if (prepared !== captured) {
+            captured.recycle()
+        }
+
+        val sourceWidth = prepared.width
+        val sourceHeight = prepared.height
+        val frameData = recognizeFrame(prepared)
+        prepared.recycle()
+        busy.set(false)
+        releaseEngineIfReleased()
+
+        if (frameData == null) {
+            return
+        }
+        scope.launch {
+            publish(frameData, sourceWidth, sourceHeight)
+        }
     }
 
     fun shutdown() {
+        released = true
         cache.clear()
-        recognizer.close()
-    }
-
-    private suspend fun handleText(visionText: Text, sourceWidth: Int, sourceHeight: Int) {
-        val blocks = ArrayList<TextBlockBox>(visionText.textBlocks.size)
-        val references = ArrayList<RecognizedReference>()
-        val usedIds = HashSet<Long>()
-
-        for (block in visionText.textBlocks) {
-            val blockBox = block.boundingBox ?: continue
-            val blockRect = RectF(blockBox)
-            blocks.add(TextBlockBox(block.text, blockRect))
-
-            for (line in block.lines) {
-                val lineBox = line.boundingBox ?: continue
-                collectMatches(line.text, RectF(lineBox), references, usedIds)
-            }
-
-            collectMatches(block.text, blockRect, references, usedIds)
+        val locked = try {
+            engineLock.tryLock(SHUTDOWN_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
         }
-
-        onScanResult(
-            ScanResult(
-                blocks = blocks,
-                references = references,
-                sourceWidth = sourceWidth,
-                sourceHeight = sourceHeight,
-                fullText = visionText.text,
-                timestamp = System.currentTimeMillis()
-            )
-        )
+        if (!locked) {
+            return
+        }
+        try {
+            recycleEngine()
+        } finally {
+            engineLock.unlock()
+        }
     }
 
-    private suspend fun collectMatches(
+    private fun recognizeFrame(bitmap: Bitmap): FrameData? {
+        engineLock.lock()
+        try {
+            val api = ensureInitialized() ?: return null
+            return recognize(api, bitmap)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Recognition failed", error)
+            return null
+        } finally {
+            engineLock.unlock()
+        }
+    }
+
+    private fun releaseEngineIfReleased() {
+        if (!released) {
+            return
+        }
+        engineLock.lock()
+        try {
+            recycleEngine()
+        } finally {
+            engineLock.unlock()
+        }
+    }
+
+    private fun recycleEngine() {
+        val api = tessBaseApi
+        tessBaseApi = null
+        api?.recycle()
+    }
+
+    private fun recognize(api: TessBaseAPI, bitmap: Bitmap): FrameData {
+        api.setImage(bitmap)
+        val fullText = api.getUTF8Text() ?: ""
+        val blocks = collectText(api, TessBaseAPI.PageIteratorLevel.RIL_BLOCK)
+        val lines = collectText(api, TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)
+        api.clear()
+        return FrameData(fullText, blocks, collectRegions(lines, blocks))
+    }
+
+    private fun collectText(api: TessBaseAPI, level: Int): List<TextBlockBox> {
+        val iterator: ResultIterator = api.getResultIterator() ?: return emptyList()
+        val result = ArrayList<TextBlockBox>()
+        try {
+            var hasNext = true
+            iterator.begin()
+            while (hasNext) {
+                val text = iterator.getUTF8Text(level)
+                val rect = iterator.getBoundingRect(level)
+                if (text != null && text.isNotBlank() && !rect.isEmpty) {
+                    result.add(TextBlockBox(text.trim(), RectF(rect)))
+                }
+                hasNext = iterator.next(level)
+            }
+        } finally {
+            iterator.delete()
+        }
+        return result
+    }
+
+    private fun collectRegions(
+        lines: List<TextBlockBox>,
+        blocks: List<TextBlockBox>
+    ): List<MatchedRegion> {
+        val regions = ArrayList<MatchedRegion>()
+        val seen = HashSet<String>()
+        for (line in lines) {
+            addMatches(line.text, line.box, regions, seen)
+        }
+        for (block in blocks) {
+            addMatches(block.text, block.box, regions, seen)
+        }
+        return regions
+    }
+
+    private fun addMatches(
         source: String,
         box: RectF,
-        references: MutableList<RecognizedReference>,
-        usedIds: MutableSet<Long>
+        regions: MutableList<MatchedRegion>,
+        seen: MutableSet<String>
     ) {
         for (match in findMatches(source)) {
-            val reference = resolve(match) ?: continue
+            if (seen.add(match.cacheKey())) {
+                regions.add(MatchedRegion(match, RectF(box)))
+            }
+        }
+    }
+
+    private suspend fun publish(frameData: FrameData, sourceWidth: Int, sourceHeight: Int) {
+        val references = ArrayList<RecognizedReference>()
+        val usedIds = HashSet<Long>()
+        for (region in frameData.regions) {
+            val reference = resolve(region.match) ?: continue
             if (!usedIds.add(reference.id)) {
                 continue
             }
-            references.add(RecognizedReference(reference, RectF(box), match.raw))
+            references.add(RecognizedReference(reference, region.box, region.match.raw))
         }
+        onScanResult(
+            ScanResult(
+                blocks = frameData.blocks,
+                references = references,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                fullText = frameData.fullText,
+                timestamp = System.currentTimeMillis()
+            )
+        )
     }
 
     private suspend fun resolve(match: LegalMatch): LegalReference? {
@@ -210,6 +321,78 @@ class OcrAnalyzer(
         val resolved = repository.resolve(match.code, match.article, match.part)
         cache[key] = resolved ?: notFound
         return resolved
+    }
+
+    private fun ensureInitialized(): TessBaseAPI? {
+        if (released) {
+            return null
+        }
+        val existing = tessBaseApi
+        if (existing != null) {
+            return existing
+        }
+        if (initFailed) {
+            return null
+        }
+        if (initAttempts >= MAX_INIT_ATTEMPTS) {
+            initFailed = true
+            Log.e(TAG, "TessBaseAPI init abandoned after " + MAX_INIT_ATTEMPTS + " attempts")
+            return null
+        }
+        initAttempts++
+        if (!prepareLanguageData(File(context.filesDir, TESSDATA_DIR_NAME))) {
+            return null
+        }
+        val api = TessBaseAPI()
+        if (!api.init(context.filesDir.absolutePath, LANGUAGE_CODE)) {
+            api.recycle()
+            Log.e(TAG, "TessBaseAPI init failed for language " + LANGUAGE_CODE)
+            return null
+        }
+        api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_AUTO)
+        api.setVariable(VAR_PRESERVE_INTERWORD_SPACES, VAR_VALUE_TRUE)
+        tessBaseApi = api
+        return api
+    }
+
+    private fun prepareLanguageData(targetDir: File): Boolean {
+        if (!targetDir.exists() && !targetDir.mkdirs()) {
+            Log.e(TAG, "Cannot create directory " + targetDir.absolutePath)
+            return false
+        }
+        val targetFile = File(targetDir, LANGUAGE_DATA_FILE)
+        if (targetFile.exists() && targetFile.length() > 0L) {
+            return true
+        }
+        return try {
+            context.assets.open(ASSET_LANGUAGE_DATA_PATH).use { input ->
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output, COPY_BUFFER_SIZE)
+                    output.flush()
+                }
+            }
+            targetFile.length() > 0L
+        } catch (error: IOException) {
+            targetFile.delete()
+            Log.e(TAG, "Cannot copy " + ASSET_LANGUAGE_DATA_PATH, error)
+            false
+        }
+    }
+
+    private fun prepare(source: Bitmap, degrees: Int): Bitmap {
+        val quarterTurn = degrees == QUARTER_TURN || degrees == THREE_QUARTER_TURN
+        val targetWidth = if (quarterTurn) source.height else source.width
+        val targetHeight = if (quarterTurn) source.width else source.height
+        val output = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val matrix = Matrix()
+        matrix.postRotate(degrees.toFloat(), source.width / 2f, source.height / 2f)
+        matrix.postTranslate(
+            (targetWidth - source.width) / 2f,
+            (targetHeight - source.height) / 2f
+        )
+        canvas.drawBitmap(source, matrix, preprocessPaint)
+        return output
     }
 
     private fun findMatches(source: String): List<LegalMatch> {
@@ -251,13 +434,50 @@ class OcrAnalyzer(
         return if (value.isNullOrEmpty()) null else value
     }
 
+    private class MatchedRegion(
+        val match: LegalMatch,
+        val box: RectF
+    )
+
+    private class FrameData(
+        val fullText: String,
+        val blocks: List<TextBlockBox>,
+        val regions: List<MatchedRegion>
+    )
+
     private companion object {
 
-        const val NOT_FOUND_ID = -1L
+        const val TAG = "OcrAnalyzer"
+
+        const val LANGUAGE_CODE = "rus"
+
+        const val LANGUAGE_DATA_FILE = "rus.traineddata"
+
+        const val ASSET_LANGUAGE_DATA_PATH = "tessdata/rus.traineddata"
+
+        const val TESSDATA_DIR_NAME = "tessdata"
+
+        const val COPY_BUFFER_SIZE = 8192
+
+        const val VAR_PRESERVE_INTERWORD_SPACES = "preserve_interword_spaces"
+
+        const val VAR_VALUE_TRUE = "1"
+
+        const val GRAYSCALE_SATURATION = 0f
+
+        const val CONTRAST = 1.25f
+
+        const val CONTRAST_ANCHOR = 128f
+
+        const val MAX_INIT_ATTEMPTS = 3
 
         const val QUARTER_TURN = 90
 
         const val THREE_QUARTER_TURN = 270
+
+        const val SHUTDOWN_LOCK_TIMEOUT_MILLIS = 100L
+
+        const val NOT_FOUND_ID = -1L
 
         const val PART_BEFORE_GROUP_INDEX = 1
 
@@ -285,5 +505,21 @@ class OcrAnalyzer(
                 MARKER_GROUP + ARTICLE_GROUP +
                 "(?:[\\s,;:.]*" + PART_GROUP + ")?"
         )
+
+        fun buildColorFilter(): ColorMatrixColorFilter {
+            val grayscale = ColorMatrix()
+            grayscale.setSaturation(GRAYSCALE_SATURATION)
+            val offset = CONTRAST_ANCHOR * (1f - CONTRAST)
+            val contrast = ColorMatrix(
+                floatArrayOf(
+                    CONTRAST, 0f, 0f, 0f, offset,
+                    0f, CONTRAST, 0f, 0f, offset,
+                    0f, 0f, CONTRAST, 0f, offset,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+            grayscale.postConcat(contrast)
+            return ColorMatrixColorFilter(grayscale)
+        }
     }
 }

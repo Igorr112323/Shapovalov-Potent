@@ -247,6 +247,7 @@ class MainActivity : AppCompatActivity(), OverlayView.OnReferenceClickListener {
             .build()
 
         val analyzer = OcrAnalyzer(
+            context = applicationContext,
             repository = viewModel.legalRepository,
             scope = lifecycleScope,
             onScanResult = { result -> viewModel.onScanResult(result) }
@@ -266,8 +267,8 @@ class MainActivity : AppCompatActivity(), OverlayView.OnReferenceClickListener {
     }
 
     private companion object {
-        const val ANALYSIS_WIDTH = 640
-        const val ANALYSIS_HEIGHT = 480
+        const val ANALYSIS_WIDTH = 1280
+        const val ANALYSIS_HEIGHT = 960
         const val NEW_LINE = "\n"
         const val DOUBLE_NEW_LINE = "\n\n"
         const val LIST_SEPARATOR = ", "

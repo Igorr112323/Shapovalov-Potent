@@ -5,10 +5,10 @@
 -keep class com.shapovalov.legalar.AppDatabase { *; }
 -keep class * extends androidx.room.RoomDatabase { *; }
 
--keep class com.google.mlkit.vision.text.latin.TextRecognizerOptions { *; }
--keep interface com.google.mlkit.vision.text.TextRecognizerOptionsInterface { *; }
--keep class com.google.mlkit.** { *; }
--dontwarn com.google.mlkit.**
+-keep class com.googlecode.tesseract.android.** { *; }
+-keep class com.googlecode.leptonica.android.** { *; }
+-dontwarn com.googlecode.tesseract.android.**
+-dontwarn com.googlecode.leptonica.android.**
 
 -keep class androidx.camera.** { *; }
 -dontwarn androidx.camera.**
