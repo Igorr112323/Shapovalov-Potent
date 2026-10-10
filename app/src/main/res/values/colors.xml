@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <color name="primary">#FF1E88E5</color>
+    <color name="on_primary">#FFFFFFFF</color>
+    <color name="secondary">#FF00E5FF</color>
+    <color name="on_secondary">#FF00222B</color>
+    <color name="surface">#FF0E1621</color>
+    <color name="on_surface">#FFE6EDF3</color>
+    <color name="background">#FF000000</color>
+    <color name="on_background">#FFE6EDF3</color>
+
+    <color name="chip_background">#B3000000</color>
+    <color name="chip_text">#FFF2F7FF</color>
+
+    <color name="overlay_block_stroke">#6600E5FF</color>
+    <color name="overlay_block_fill">#1400E5FF</color>
+    <color name="overlay_reference_stroke">#FFFFC400</color>
+    <color name="overlay_reference_fill">#33FFC400</color>
+    <color name="overlay_connector">#CCFFC400</color>
+
+    <color name="overlay_card_background">#EE0E1621</color>
+    <color name="overlay_card_stroke">#FF1E88E5</color>
+    <color name="overlay_card_stroke_pressed">#FF00E5FF</color>
+    <color name="overlay_card_title">#FFFFFFFF</color>
+    <color name="overlay_card_body">#DDF2F7FF</color>
+    <color name="overlay_card_meta">#FF9FD8FF</color>
+
+    <color name="risk_low">#FF43A047</color>
+    <color name="risk_medium">#FFFB8C00</color>
+    <color name="risk_high">#FFE53935</color>
+
+    <color name="launcher_background">#FF0E1621</color>
+
+</resources>
