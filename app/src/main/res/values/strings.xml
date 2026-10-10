@@ -24,4 +24,10 @@
 
     <string name="close">Закрыть</string>
 
+    <string name="error_model_missing">Не найден файл rus.traineddata в папке app/src/main/assets/tessdata. Скачайте его по инструкции из README.md — без него распознавание русского текста невозможно.</string>
+    <string name="error_engine_init">Не удалось инициализировать движок распознавания Tesseract.</string>
+    <string name="error_engine_stopped">Распознавание остановлено: движок не запустился после нескольких попыток.</string>
+    <string name="error_frame_capture">Не удалось получить кадр с камеры для распознавания.</string>
+    <string name="error_recognition">Сбой при распознавании кадра.</string>
+
 </resources>

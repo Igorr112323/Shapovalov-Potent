@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -97,6 +98,7 @@ class OcrAnalyzer(
     private val repository: LegalRepository,
     private val scope: CoroutineScope,
     private val onScanResult: (ScanResult) -> Unit,
+    private val onError: (String) -> Unit,
     private val minIntervalMillis: Long = DEFAULT_MIN_INTERVAL_MILLIS
 ) : ImageAnalysis.Analyzer {
 
@@ -105,6 +107,8 @@ class OcrAnalyzer(
     private val lastStartMillis = AtomicLong(0L)
 
     private val cache = ConcurrentHashMap<String, LegalReference>()
+
+    private val reportedErrors = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     private val engineLock = ReentrantLock()
 
@@ -154,6 +158,7 @@ class OcrAnalyzer(
             imageProxy.toBitmap()
         } catch (error: RuntimeException) {
             Log.e(TAG, "Frame conversion failed", error)
+            reportError(context.getString(R.string.error_frame_capture))
             null
         } finally {
             imageProxy.close()
@@ -209,6 +214,7 @@ class OcrAnalyzer(
             return recognize(api, bitmap)
         } catch (error: Throwable) {
             Log.e(TAG, "Recognition failed", error)
+            reportError(context.getString(R.string.error_recognition))
             return null
         } finally {
             engineLock.unlock()
@@ -224,6 +230,12 @@ class OcrAnalyzer(
             recycleEngine()
         } finally {
             engineLock.unlock()
+        }
+    }
+
+    private fun reportError(message: String) {
+        if (reportedErrors.add(message)) {
+            onError(message)
         }
     }
 
@@ -337,16 +349,19 @@ class OcrAnalyzer(
         if (initAttempts >= MAX_INIT_ATTEMPTS) {
             initFailed = true
             Log.e(TAG, "TessBaseAPI init abandoned after " + MAX_INIT_ATTEMPTS + " attempts")
+            reportError(context.getString(R.string.error_engine_stopped))
             return null
         }
         initAttempts++
         if (!prepareLanguageData(File(context.filesDir, TESSDATA_DIR_NAME))) {
+            reportError(context.getString(R.string.error_model_missing))
             return null
         }
         val api = TessBaseAPI()
         if (!api.init(context.filesDir.absolutePath, LANGUAGE_CODE)) {
             api.recycle()
             Log.e(TAG, "TessBaseAPI init failed for language " + LANGUAGE_CODE)
+            reportError(context.getString(R.string.error_engine_init))
             return null
         }
         api.setPageSegMode(TessBaseAPI.PageSegMode.PSM_AUTO)

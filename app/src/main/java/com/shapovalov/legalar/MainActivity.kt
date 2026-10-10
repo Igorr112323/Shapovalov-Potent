@@ -250,7 +250,12 @@ class MainActivity : AppCompatActivity(), OverlayView.OnReferenceClickListener {
             context = applicationContext,
             repository = viewModel.legalRepository,
             scope = lifecycleScope,
-            onScanResult = { result -> viewModel.onScanResult(result) }
+            onScanResult = { result -> viewModel.onScanResult(result) },
+            onError = { message ->
+                binding.statusText.post {
+                    binding.statusText.text = message
+                }
+            }
         )
         analysis.setAnalyzer(analysisExecutor, analyzer)
 
